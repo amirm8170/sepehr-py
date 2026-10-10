@@ -1,0 +1,8 @@
+quantity,reference_value,unit,data_type,source
+drill_pipe_loss,373.2318,psi,synthetic,"Hand calculation, Applied Drilling Engineering ch. 4"
+bha_loss,143.7026,psi,synthetic,"Hand calculation, Applied Drilling Engineering ch. 4"
+bit_loss,1027.5307,psi,synthetic,"Hand calculation, Applied Drilling Engineering ch. 4"
+annulus_loss,281.1683,psi,synthetic,"Hand calculation, Applied Drilling Engineering ch. 4"
+bhp,5581.1683,psi,synthetic,"Hand calculation, Applied Drilling Engineering ch. 4"
+spp,1925.6334,psi,synthetic,"Hand calculation, Applied Drilling Engineering ch. 4"
+ecd,10.5407,ppg,synthetic,"Hand calculation, Applied Drilling Engineering ch. 4"

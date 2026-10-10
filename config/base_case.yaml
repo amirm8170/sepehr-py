@@ -1,0 +1,68 @@
+# ======================================================================
+# BASE CASE  (synthetic demonstration well — NOT real field data)
+# Units are written in every key name: _m, _in, _ppg, _cp, _gpm, _psi ...
+# The program converts everything to SI units when it reads this file.
+# ======================================================================
+name: Base case - J-type MPD well (synthetic)
+
+well:
+  survey_file: data/trajectory_example.csv   # columns: md_m, tvd_m, inclination_deg, azimuth_deg
+  hole_sections:                             # from surface to TD
+    - {name: Casing 9-5/8 in, top_m: 0, bottom_m: 1800, diameter_in: 8.681}
+    - {name: Open hole 8-1/2 in, top_m: 1800, bottom_m: 3500, diameter_in: 8.5}
+  drill_string:                              # from surface to bit
+    - {name: Drill pipe 5 in, type: drill_pipe, length_m: 3300, od_in: 5.0, id_in: 4.276}
+    - {name: BHA 6-1/2 in collars, type: bha, length_m: 200, od_in: 6.5, id_in: 2.8125}
+  bit:
+    nozzles_32nd: [13, 13, 13, 13]
+    discharge_coefficient: 0.95
+
+mud:                       # Bingham Plastic fluid
+  density_ppg: 10.0
+  pv_cp: 20.0
+  yp_lbf100ft2: 15.0
+  gel_10min_lbf100ft2: 12.0
+
+operation:
+  pump_rate_gpm: 500
+  back_pressure_from: choke    # "choke" (choke equation) or "fixed" (use back_pressure_psi)
+  back_pressure_psi: 150
+  choke_opening: auto          # number 0..1, or "auto" = opening that gives the target BHP
+  bp_pump_gpm: 0               # MPD back-pressure pump (flows only through the choke)
+  pipe_velocity_m_s: 0.0       # + down (surge), - up (swab)
+  clinging_constant: 0.45
+
+pressure_window:               # at the bottom of the well, as equivalent mud weight
+  pore_ppg: 10.4
+  fracture_ppg: 11.8
+  target_ppg: 11.0
+  warning_margin_psi: 100
+
+choke:                         # Q[gpm] = Cv * sqrt(dP[psi] / SG),  Cv = Cv_closed + (Cv_max - Cv_closed) * opening
+  cv_max: 100.0
+  cv_closed: 1.0
+  min_opening: 0.02
+  max_opening: 1.0
+  max_speed_per_s: 0.05        # how fast the choke can move [fraction per second]
+
+dynamics:
+  model: lumped                # "lumped" (with mud compressibility) or "quasi_steady"
+  actuator: choke              # "choke" or "back_pressure"
+  time_step_s: 0.1
+  bulk_modulus_pa: 1.5e9       # mud compressibility (calibrate!)
+  bp_time_constant_s: 2.0      # response time of the back-pressure actuator
+  bp_max_psi: 1500
+  profile_every_s: 10
+
+pid:                           # gains for choke actuation: [fraction of opening per bar of error]
+  kp: 0.1
+  ki: 0.05
+  kd: 0.0
+  bp_kp: 0.6                   # gains for back-pressure actuation: [bar of SBP per bar of error]
+  bp_ki: 0.3
+  derivative_filter_s: 1.0
+  settling_band_psi: 15
+
+numerics:
+  segment_length_m: 30
+  low_flow_gpm: 50             # dynamic model: friction goes linearly to 0 below this flow

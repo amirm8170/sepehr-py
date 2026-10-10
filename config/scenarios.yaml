@@ -1,0 +1,81 @@
+# ======================================================================
+# DYNAMIC SCENARIOS
+# Schedules are lists of [time_s, value]; values change linearly between
+# points and stay constant after the last point.
+#   pump_gpm, bp_pump_gpm, choke_change (added to the starting opening),
+#   back_pressure_psi, pipe_velocity_m_s, target_ppg
+# events_s: times of the disturbances (used for settling time etc.)
+# ======================================================================
+constant_pump_rate:
+  title: "1 - Constant pump rate"
+  description: Nothing changes; BHP must stay constant (equilibrium check).
+  duration_s: 120
+  events_s: [0]
+
+pump_rate_increase:
+  title: "2 - Pump rate increase"
+  description: Pump rate 500 -> 650 gpm with a fixed choke.
+  duration_s: 240
+  events_s: [30]
+  pump_gpm: [[0, 500], [30, 500], [60, 650]]
+
+pump_rate_decrease:
+  title: "3 - Pump rate decrease"
+  description: Pump rate 500 -> 350 gpm with a fixed choke.
+  duration_s: 240
+  events_s: [30]
+  pump_gpm: [[0, 500], [30, 500], [60, 350]]
+
+pump_start:
+  title: "4 - Pump start"
+  description: Pumps start from 0 to 500 gpm; the choke is fixed at 43 % open.
+  duration_s: 300
+  events_s: [20]
+  start_choke_opening: 0.43
+  pump_gpm: [[0, 0], [20, 0], [80, 500]]
+
+pump_stop:
+  title: "5 - Pump stop"
+  description: Pumps stop with a fixed choke and no back-pressure pump - friction pressure is lost.
+  duration_s: 300
+  events_s: [20]
+  pump_gpm: [[0, 500], [20, 500], [80, 0]]
+
+choke_opening:
+  title: "6 - Choke opening"
+  description: The choke opens by 15 % - BHP falls.
+  duration_s: 180
+  events_s: [30]
+  choke_change: [[0, 0], [30, 0], [35, 0.15]]
+
+choke_closing:
+  title: "7 - Choke closing"
+  description: The choke closes by 10 % - BHP rises.
+  duration_s: 180
+  events_s: [30]
+  choke_change: [[0, 0], [30, 0], [35, -0.10]]
+
+back_pressure_change:
+  title: "8 - Back-pressure change"
+  description: Surface back pressure is raised from 150 to 300 psi (back-pressure actuator).
+  duration_s: 180
+  events_s: [30]
+  actuator: back_pressure
+  back_pressure_psi: [[0, 150], [30, 150], [33, 300]]
+
+pipe_movement:
+  title: "9 - Pipe movement (surge / swab)"
+  description: Pipe runs in at 0.5 m/s (surge), then pulls out at 0.5 m/s (swab).
+  duration_s: 240
+  events_s: [30]
+  pipe_velocity_m_s: [[0, 0], [30, 0], [35, 0.5], [75, 0.5], [80, 0], [120, 0], [125, -0.5], [165, -0.5], [170, 0]]
+
+pid_control:
+  title: "10 - PID control of BHP"
+  description: Connection - pumps stop and restart while the back-pressure pump runs; then the target BHP is raised. PID moves the choke.
+  duration_s: 600
+  events_s: [30, 270, 450]
+  pid: true
+  pump_gpm: [[0, 500], [30, 500], [90, 0], [270, 0], [330, 500]]
+  bp_pump_gpm: [[0, 0], [20, 0], [30, 150], [360, 150], [380, 0]]
+  target_ppg: [[0, 11.0], [450, 11.0], [451, 11.15]]
