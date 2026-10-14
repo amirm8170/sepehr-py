@@ -5,6 +5,7 @@ MPD well hydraulics simulator - desktop application (Tkinter + matplotlib).
 
 The window has a navigation bar on the left and one page per task:
   Steady state   - BHP, SPP, ECD and the pressure profile (Stage A)
+  Input file     - upload ONE CSV with every input (and several muds / cases)
   Dynamic        - the 10 time scenarios (Stage B)
   PID control    - tune the controller, compare with / without PID
   Sensitivity    - tornado chart and parameter sweep
@@ -13,6 +14,7 @@ The window has a navigation bar on the left and one page per task:
 """
 
 import tkinter as tk
+from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 import matplotlib
@@ -26,6 +28,8 @@ from mpd import analysis, plots
 from mpd import units as u
 from mpd.dynamics import simulate
 from mpd.hydraulics import solve_steady
+from mpd.autofix import auto_fix
+from mpd.library import case_names, read_case_csv, read_table, write_case_csv
 from mpd.well import ROOT, build_case, load_config, make_segments
 
 # ----------------------------------------------------------------------
@@ -181,7 +185,7 @@ def event_table(metrics, unit):
 # ----------------------------------------------------------------------
 class App(tk.Tk):
 
-    PAGES = [("steady", "Steady state", "◉"), ("dynamic", "Dynamic scenarios", "◷"),
+    PAGES = [("steady", "Steady state", "◉"), ("library", "Input file (CSV)", "≋"), ("dynamic", "Dynamic scenarios", "◷"),
              ("pid", "PID control", "⟲"), ("sensitivity", "Sensitivity", "▤"),
              ("validation", "Validation", "✓"), ("case", "Case file", "✎")]
 
@@ -199,6 +203,7 @@ class App(tk.Tk):
         self.unit = tk.StringVar(value="bar")
         self.sim = None            # last dynamic simulation
         self.pid_runs = None       # last PID comparison (with, without)
+        self.library = {}          # cases read from the input CSV {name: case file}
 
         self.sidebar()
         self.content = tk.Frame(self, bg=PAGE)
@@ -208,6 +213,7 @@ class App(tk.Tk):
             self.pages[key] = tk.Frame(self.content, bg=PAGE)
             self.pages[key].place(relx=0, rely=0, relwidth=1, relheight=1)
         self.steady_page()
+        self.library_page()
         self.dynamic_page()
         self.pid_page()
         self.sensitivity_page()
@@ -316,17 +322,22 @@ class App(tk.Tk):
     # Case handling
     # ------------------------------------------------------------------
     def load_case(self):
-        """Build the case from self.config_data and refresh the pages."""
+        """Auto-fix the inputs (if switched on), build the case and refresh the pages."""
         try:
+            fixed, report = auto_fix(self.config_data)
+            if self.fix_on.get():
+                self.config_data = fixed
             self.case = build_case(self.config_data)
             self.seg = make_segments(self.case)
         except Exception as error:
             messagebox.showerror("Input error", str(error))
             return False
         self.fill_inputs()
+        self.show_report(report)
         self.case_text.delete("1.0", "end")
         self.case_text.insert("1.0", yaml.safe_dump(self.config_data, sort_keys=False))
-        self.case_label.config(text=f"{self.case.name}\n{len(self.seg)} segments")
+        variant = self.config_data["mud"].get("name", "from case file")
+        self.case_label.config(text=f"{self.case.name}\nCase: {variant}\n{len(self.seg)} segments")
         self.calculate_steady()
         return True
 
@@ -365,20 +376,24 @@ class App(tk.Tk):
                                           ("pv", "Plastic viscosity [cP]"),
                                           ("yp", "Yield point [lbf/100ft²]"),
                                           ("sbp", "Back pressure [psi]"),
-                                          ("opening", "Choke opening [0-1]")]):
+                                          ("opening", "Choke opening [0-1]"),
+                                          ("target", "Target BHP [ppg EMW]")]):
             self.inputs[key] = labeled_entry(form, i, label)
             self.inputs[key].bind("<Return>", lambda e: self.apply_inputs())
         self.bp_mode = tk.StringVar(value="choke")
         self.auto_choke = tk.BooleanVar(value=True)
         tk.Label(form, text="Back pressure from", bg=CARD, fg=MUTED, font=(FONT, 12)).grid(
-            row=6, column=0, sticky="w", pady=(10, 2))
+            row=7, column=0, sticky="w", pady=(10, 2))
         modes = tk.Frame(form, bg=CARD)
-        modes.grid(row=7, column=0, columnspan=2, sticky="w")
+        modes.grid(row=8, column=0, columnspan=2, sticky="w")
         ttk.Radiobutton(modes, text="Choke", value="choke", variable=self.bp_mode).pack(side="left")
         ttk.Radiobutton(modes, text="Fixed value", value="fixed", variable=self.bp_mode).pack(side="left", padx=12)
         ttk.Checkbutton(form, text="Auto choke (reach target BHP)", variable=self.auto_choke).grid(
-            row=8, column=0, columnspan=2, sticky="w", pady=8)
-        button(form, "Calculate", self.apply_inputs).grid(row=9, column=0, columnspan=2,
+            row=9, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.fix_on = tk.BooleanVar(value=True)
+        ttk.Checkbutton(form, text="Auto-fix result (explain why)", variable=self.fix_on).grid(
+            row=10, column=0, columnspan=2, sticky="w", pady=(4, 8))
+        button(form, "Calculate", self.apply_inputs).grid(row=11, column=0, columnspan=2,
                                                            sticky="ew", pady=(8, 0))
         info = card(left, "Pressure accounting", fill="both", expand=True)
         self.accounting = tk.Label(info, text="", bg=CARD, fg=TEXT, font=("Menlo", 11),
@@ -387,6 +402,9 @@ class App(tk.Tk):
 
         right = tk.Frame(body, bg=PAGE)
         right.pack(side="left", fill="both", expand=True)
+        self.notice = tk.Label(right, text="", bg="#fef3c7", fg="#92400e", font=(FONT, 12),
+                               justify="left", anchor="w", padx=12, pady=8)
+        self.notice.bind("<Configure>", lambda e: self.notice.config(wraplength=e.width - 30))
         self.steady_pill = tk.Label(right, text="", font=(FONT, 12, "bold"), padx=12, pady=5)
         self.steady_pill.pack(anchor="w", pady=(0, 8))
         tiles = tk.Frame(right, bg=PAGE)
@@ -418,7 +436,8 @@ class App(tk.Tk):
         values = {"pump": op["pump_rate_gpm"], "mw": cfg["mud"]["density_ppg"],
                   "pv": cfg["mud"]["pv_cp"], "yp": cfg["mud"]["yp_lbf100ft2"],
                   "sbp": op["back_pressure_psi"],
-                  "opening": op["choke_opening"] if op["choke_opening"] != "auto" else 0.5}
+                  "opening": op["choke_opening"] if op["choke_opening"] != "auto" else 0.5,
+                  "target": cfg["pressure_window"]["target_ppg"]}
         for key, value in values.items():
             self.inputs[key].delete(0, "end")
             self.inputs[key].insert(0, str(value))
@@ -440,7 +459,25 @@ class App(tk.Tk):
         op["back_pressure_from"] = self.bp_mode.get()
         op["choke_opening"] = "auto" if self.auto_choke.get() else v["opening"]
         mud["density_ppg"], mud["pv_cp"], mud["yp_lbf100ft2"] = v["mw"], v["pv"], v["yp"]
+        self.config_data["pressure_window"]["target_ppg"] = v["target"]
         self.load_case()
+
+    def show_report(self, report):
+        """Yellow banner on the steady page: problem, why, what was done, how to fix on the rig."""
+        if not report:
+            self.notice.pack_forget()
+            return
+        applied = self.fix_on.get()
+        title = (f"⚙  AUTO-FIX - {len(report)} problem(s) found and corrected" if applied else
+                 f"⚠  {len(report)} problem(s) found - auto-fix is OFF, suggested corrections:")
+        lines = [title]
+        for i, item in enumerate(report, 1):
+            lines += [f"{i}.  {item['problem']}",
+                      f"      Why:   {item['why']}",
+                      f"      {'Done' if applied else 'Would do'}:  {item['done']}",
+                      f"      How to fix on the rig:  {item['how']}"]
+        self.notice.config(text="\n".join(lines))
+        self.notice.pack(fill="x", pady=(0, 8), before=self.steady_pill)
 
     def calculate_steady(self):
         r = solve_steady(self.case, self.seg)
@@ -481,7 +518,84 @@ class App(tk.Tk):
                                            "Pipe dP [Pa]", "Annulus flow", "Annulus dP [Pa]"]], 1)
 
     # ------------------------------------------------------------------
-    # Page 2: dynamic scenarios
+    # Page 2: input file (one CSV with everything)
+    # ------------------------------------------------------------------
+    def library_page(self):
+        body = self.page_header("library", "Input file (CSV)",
+                                "One CSV with EVERY input - well, mud, operation, window, choke, "
+                                "PID - and several muds / cases side by side")
+        top = card(body, None, fill="x", expand=False, pady=(0, 6))
+        button(top, "Upload CSV…", self.upload_library).pack(side="left")
+        button(top, "Load example", lambda: self.open_library(ROOT / "data" / "case_library.csv"),
+               primary=False).pack(side="left", padx=10)
+        button(top, "Export current case…", self.export_case, primary=False).pack(side="left")
+        self.library_file = tk.Label(top, text="No file loaded", bg=CARD, fg=MUTED, font=(FONT, 12))
+        self.library_file.pack(side="left", padx=14)
+        button(top, "Use this case", self.use_case).pack(side="right")
+        self.case_box = ttk.Combobox(top, state="readonly", width=28, font=(FONT, 12))
+        self.case_box.pack(side="right", padx=10)
+
+        row = tk.Frame(body, bg=PAGE)
+        row.pack(fill="both", expand=True)
+        help_box = card(row, "CSV format", side="right", fill="y", expand=False)
+        help_box.master.config(width=360)
+        help_box.master.pack_propagate(False)
+        tk.Label(help_box, bg=CARD, fg=TEXT, font=(FONT, 12), justify="left", anchor="nw",
+                 wraplength=320, text=(
+                     "One row = one input.\n\n"
+                     "parameter = its place in the case file:\n"
+                     "   mud.density_ppg\n   operation.pump_rate_gpm\n"
+                     "   well.hole_sections.2.diameter_in\n"
+                     "   well.survey.5  →  md;tvd;inc;azi\n"
+                     "   well.bit.nozzles_32nd  →  13;13;13\n\n"
+                     "unit, description = for reading only.\n\n"
+                     "Every further column = one case (e.g. one mud). The FIRST case must "
+                     "contain every input; in the others an empty cell = same as the first.\n\n"
+                     "Lists use ';'. Lines starting with # are comments.\n\n"
+                     "Tip: 'Export current case' writes a complete file to start from.\n\n"
+                     "After loading, the result is checked and auto-fixed; the yellow box on "
+                     "the Steady page explains why and how.")).pack(fill="both", expand=True)
+        table_box = card(row, None, side="left", padx=(0, 12))
+        self.library_tree = table(table_box, height=14)
+
+    def upload_library(self):
+        path = filedialog.askopenfilename(initialdir=ROOT / "data", filetypes=[("CSV", "*.csv")])
+        if path:
+            self.open_library(path)
+
+    def open_library(self, path):
+        try:
+            shown = read_table(path)
+            self.library = read_case_csv(path)
+        except Exception as error:
+            messagebox.showerror("CSV error", str(error))
+            return
+        fill_table(self.library_tree, shown.fillna(""), 3)
+        names = case_names(shown)
+        self.case_box.config(values=names)
+        self.case_box.current(0)
+        self.library_file.config(text=f"{len(shown)} inputs  ·  {len(names)} cases  ·  {Path(path).name}")
+
+    def use_case(self):
+        if not self.library:
+            messagebox.showinfo("Input file", "Upload a CSV (or load the example) first.")
+            return
+        old = self.config_data
+        self.config_data = self.library[self.case_box.get()]
+        if self.load_case():
+            self.show("steady")
+        else:
+            self.config_data = old
+
+    def export_case(self):
+        path = filedialog.asksaveasfilename(initialdir=ROOT / "data", defaultextension=".csv",
+                                            filetypes=[("CSV", "*.csv")])
+        if path:
+            name = self.config_data["mud"].get("name", self.config_data.get("name", "case"))
+            write_case_csv(path, {name: self.config_data})
+
+    # ------------------------------------------------------------------
+    # Page 3: dynamic scenarios
     # ------------------------------------------------------------------
     def dynamic_page(self):
         body = self.page_header("dynamic", "Dynamic scenarios",
@@ -559,7 +673,7 @@ class App(tk.Tk):
         fill_table(self.dyn_events, event_table(m, unit), 1)
 
     # ------------------------------------------------------------------
-    # Page 3: PID control
+    # Page 4: PID control
     # ------------------------------------------------------------------
     def pid_page(self):
         body = self.page_header("pid", "PID control of bottomhole pressure",
@@ -628,7 +742,7 @@ class App(tk.Tk):
         fill_table(self.pid_events, event_table(with_pid["metrics"], unit), 1)
 
     # ------------------------------------------------------------------
-    # Page 4: sensitivity
+    # Page 5: sensitivity
     # ------------------------------------------------------------------
     def sensitivity_page(self):
         body = self.page_header("sensitivity", "Sensitivity analysis",
@@ -684,7 +798,7 @@ class App(tk.Tk):
             f"SPP [{unit}]": p(data["spp"]), "ECD [ppg]": u.ppg(data["ecd"])}), 2)
 
     # ------------------------------------------------------------------
-    # Page 5: validation
+    # Page 6: validation
     # ------------------------------------------------------------------
     def validation_page(self):
         body = self.page_header("validation", "Validation",
@@ -720,7 +834,7 @@ class App(tk.Tk):
                                          "absolute_error", "error_percent", "data_type"]], 2)
 
     # ------------------------------------------------------------------
-    # Page 6: case file
+    # Page 7: case file
     # ------------------------------------------------------------------
     def case_page(self):
         body = self.page_header("case", "Case file",

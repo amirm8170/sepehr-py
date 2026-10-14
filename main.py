@@ -6,6 +6,7 @@ MPD well hydraulics simulator - command-line program.
     python main.py --sensitivity           + sensitivity analysis
     python main.py --validate              + comparison with reference data
     python main.py --case config/validation_case.yaml
+    python main.py --case data/case_library.csv --variant "OBM 11.0 ppg"
 
 Results (CSV files and PNG charts) are saved in the folder outputs/.
 For the window version run:  python app.py
@@ -24,6 +25,8 @@ from mpd import analysis, plots
 from mpd import units as u
 from mpd.dynamics import simulate
 from mpd.hydraulics import solve_steady
+from mpd.autofix import auto_fix
+from mpd.library import read_case_csv
 from mpd.well import build_case, load_config, make_segments
 
 OUT = Path("outputs")
@@ -110,13 +113,29 @@ def run_validation():
 
 def main():
     parser = argparse.ArgumentParser(description="MPD well hydraulics simulator")
-    parser.add_argument("--case", default="config/base_case.yaml")
+    parser.add_argument("--case", default="config/base_case.yaml", help="YAML or CSV case file")
     parser.add_argument("--scenario", default="all", help="'all', 'none' or a scenario name")
     parser.add_argument("--sensitivity", action="store_true")
     parser.add_argument("--validate", action="store_true")
+    parser.add_argument("--variant", help="case column of a CSV case file (default: the first)")
+    parser.add_argument("--no-fix", action="store_true", help="only report problems, do not auto-fix")
     args = parser.parse_args()
 
-    config = load_config(args.case)
+    if args.case.endswith(".csv"):
+        cases = read_case_csv(args.case)
+        name = args.variant or next(iter(cases))
+        if name not in cases:
+            parser.error(f"case '{name}' not found; choose from: {', '.join(cases)}")
+        config = cases[name]
+        print(f"Case: {name}")
+    else:
+        config = load_config(args.case)
+    fixed, report = auto_fix(config)
+    if not args.no_fix:
+        config = fixed
+    for i, item in enumerate(report, 1):
+        print(f"\nAUTO-FIX {i}: {item['problem']}\n   Why:  {item['why']}\n"
+              f"   {'Done' if not args.no_fix else 'Would do'}: {item['done']}\n   How to fix on the rig: {item['how']}")
     case = build_case(config)
     seg = make_segments(case)
     print(f"Well split into {len(seg)} segments.")

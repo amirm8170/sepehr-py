@@ -79,7 +79,7 @@ def spp_breakdown(fig, result, unit="bar"):
     ax.barh(names[::-1], values[::-1], color=BLUE, height=0.6)
     for i, v in enumerate(values[::-1]):
         ax.text(v, i, f"  {v:,.1f}", va="center", fontsize=9)
-    ax.set_xlim(0, max(values) * 1.25)
+    ax.set_xlim(0, max(max(values) * 1.25, 1.0))          # all zero when nothing flows
     ax.set_xlabel(f"Pressure [{unit}]")
     ax.set_title(f"SPP = {conv(result['spp']):,.1f} {unit}", loc="left", fontweight="bold")
     _style(ax)
