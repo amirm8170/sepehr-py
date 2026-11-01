@@ -1,288 +1,263 @@
 """
-Stage B - dynamic (time) simulation of the well and closed-loop BHP control.
+Four-state dynamic model of the well (proposal 4-2-5) and its simulation.
 
-Dynamic model (simplified MPD model, as used for controller design in
-Kaasa et al. 2012 and Godhavn 2010):
+States:  p_p  stand-pipe pressure          q  flow through string and bit
+         p_c  choke (upstream) pressure    z  physical choke opening
 
-    The mud in the annulus is slightly compressible. The choke pressure p_c
-    changes when the flow into the annulus differs from the flow out
-    through the choke:
+    (V_d / beta_eff) dp_p/dt = q_pump - q                                     (1)
+    (V_a / beta_eff) dp_c/dt = q + q_bpp - q_c                                (2)
+    M dq/dt = p_p - p_c - (rho_a - rho_d) g h - dP_d - dP_bit - dP_a          (3)
+    dz/dt   = r_max tanh(((z_cmd - z) / tau_a) / r_max)                       (4)
 
-        dp_c/dt = (bulk_modulus / V_annulus) * (Q_in - Q_choke)
+    BHP = p_c + rho g h + dP_a(q)     (inertia of the annulus column not included)
 
-        Q_in     = pump rate + back-pressure pump + pipe displacement
-        Q_choke  = K(opening) * sqrt(p_c / rho)
+Friction is quasi-steady: the steady formulas with the flow of the moment.
+A fifth "bookkeeping" variable integrates q_pump + q_bpp - q_c, so the
+mass balance (1) + (2) can be checked at every output time:
 
-    Friction is taken from the steady-state model for the current flow
-    (quasi-steady friction), so:
+    (V_d/beta)(p_p - p_p0) + (V_a/beta)(p_c - p_c0) = integral(q_pump + q_bpp - q_c) dt
 
-        BHP = p_c + rho g TVD + annular friction
-        SPP = p_c + all friction losses
-
-    "quasi_steady" model: no compressibility - p_c is found directly from the
-    choke equation at every time step.
-    "back_pressure" actuator: the surface back pressure follows its set-point
-    with a first-order delay (time constant tau).
-
-Assumptions: single-phase mud, flow along the drill string is incompressible
-(pump changes reach the bit immediately), no influx or losses.
+Time loop: the controller runs every T_s with a zero-order hold; between two
+samples the ODEs are integrated with scipy solve_ivp (Radau by default).
+The measurement is BHP(t - theta_m), the command reaches the actuator after theta_a.
 """
 
-import math
+from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
+from scipy.integrate import solve_ivp
 
 from . import units as u
-from .analysis import control_metrics
-from .hydraulics import (annulus_area, choke_flow, choke_pressure_drop, friction_losses,
-                         hydrostatic, pipe_area, solve_steady, window_status)
+from .choke import actuator_rate, choke_flow
+from .controller import PID, controller_gains
+from .hydraulics import flow_geometry, pressure_losses, pressure_profile, solve_steady, window_status
+from .metrics import performance_metrics
+from .well import flow_path
 
 
-# ----------------------------------------------------------------------
-# PID controller
-# ----------------------------------------------------------------------
-class PID:
-    """
-    Discrete PID controller.
-
-        error  = (target - measured)            (divided by `scale`, e.g. 1 bar)
-        output = bias + Kp*error + Ki*integral(error) + Kd*d(error)/dt
-
-    Extras that a real controller needs:
-      * output limits (e.g. choke 2 % ... 100 % open)
-      * rate limit   (the choke cannot move faster than its motor)
-      * anti-windup  (the integral stops growing while the output is at a limit)
-      * derivative on the measurement + filter (no jump when the target changes)
-      * reverse action (closing the choke RAISES the pressure)
-    """
-
-    def __init__(self, kp, ki, kd, out_min, out_max, rate_limit=None, reverse=False,
-                 scale=1.0, filter_time=0.0):
-        self.kp, self.ki, self.kd = kp, ki, kd
-        self.reverse = reverse
-        self.scale = scale
-        self.filter_time = filter_time
-        self.set_limits(out_min, out_max, rate_limit)
-        self.reset(0.0)
-
-    def set_limits(self, out_min, out_max, rate_limit=None):
-        self.out_min, self.out_max, self.rate_limit = out_min, out_max, rate_limit
-
-    def reset(self, bias):
-        """Start again from output = bias (no jump when the controller is switched on)."""
-        self.bias = bias
-        self.integral = 0.0
-        self.last_measurement = None
-        self.derivative = 0.0
-        self.output = bias
-        self.p_term = self.i_term = self.d_term = 0.0
-
-    def update(self, target, measured, dt):
-        sign = -1.0 if self.reverse else 1.0
-        error = sign * (target - measured) / self.scale
-
-        # derivative of the measurement, smoothed by a first-order filter
-        if self.last_measurement is not None:
-            raw = -sign * (measured - self.last_measurement) / self.scale / dt
-            a = self.filter_time / (self.filter_time + dt)
-            self.derivative = a * self.derivative + (1 - a) * raw
-        self.last_measurement = measured
-
-        new_integral = self.integral + error * dt
-        wanted = self.bias + self.kp * error + self.ki * new_integral + self.kd * self.derivative
-
-        # limits
-        out = min(max(wanted, self.out_min), self.out_max)
-        if self.rate_limit:
-            step = self.rate_limit * dt
-            out = min(max(out, self.output - step), self.output + step)
-
-        # anti-windup: only integrate if we are not pushing further into a limit
-        limited = abs(out - wanted) > 1e-12
-        if not (limited and np.sign(error) == np.sign(wanted - out)):
-            self.integral = new_integral
-
-        self.p_term = self.kp * error
-        self.i_term = self.ki * self.integral
-        self.d_term = self.kd * self.derivative
-        self.output = out
-        return out
+class Cancelled(Exception):
+    """Raised when the user cancels a running simulation."""
 
 
-# ----------------------------------------------------------------------
-# Schedules
-# ----------------------------------------------------------------------
-def schedule_value(points, t, default):
-    """Value of a schedule [[time, value], ...] at time t (linear between points)."""
+def schedule(points, default):
+    """Function of time from [[t, value], ...] (linear between points, constant outside)."""
     if not points:
-        return default
-    times = [p[0] for p in points]
-    values = [p[1] for p in points]
-    return float(np.interp(t, times, values))
+        return lambda t: default
+    times = np.array([p[0] for p in points], float)
+    values = np.array([p[1] for p in points], float)
+    return lambda t: float(np.interp(t, times, values))
 
 
-# ----------------------------------------------------------------------
-# Simulation
-# ----------------------------------------------------------------------
-def simulate(case, seg, scenario, progress=None):
+@dataclass
+class SimulationResult:
+    name: str
+    title: str
+    controller: str               # "none", "P", "PI" or "PID"
+    timeseries: pd.DataFrame
+    metrics: dict
+    mass_balance: dict
+    solver: dict
+    initial: object               # SteadyResult at t = 0
+    convergence: dict = field(default_factory=dict)
+    warnings: list = field(default_factory=list)
+
+
+class FourStateModel:
+    """Right-hand side of the ODEs (1)-(4) for one case."""
+
+    def __init__(self, case, seg, pump, bpp):
+        self.case, self.pump, self.bpp = case, pump, bpp
+        self.path = flow_path(case, seg)
+        self.geo = flow_geometry(seg, grouped=True)
+        self.beta = case.beta_eff
+
+    def losses(self, q):
+        loss = pressure_losses(self.case, self.geo, q)
+        return loss["dp_d"], loss["dp_bit"], loss["dp_a"]
+
+    def rhs(self, t, x, z_cmd):
+        p_p, p_c, q, z, _ = x
+        case, path = self.case, self.path
+        q_pump, q_bpp = self.pump(t), self.bpp(t)
+        q_c = choke_flow(p_c, z, case.rho, case.choke)
+        dp_d, dp_bit, dp_a = self.losses(q)
+        return [self.beta / path.v_d * (q_pump - q),                                  # (1)
+                self.beta / path.v_a * (q + q_bpp - q_c),                             # (2)
+                (p_p - p_c - 0.0 - dp_d - dp_bit - dp_a) / path.inertance,            # (3) rho_a = rho_d
+                actuator_rate(z_cmd, z, case.actuator, case.choke),                   # (4)
+                q_pump + q_bpp - q_c]                                                 # bookkeeping
+
+    def outputs(self, t, x):
+        """Measured quantities for one state vector."""
+        p_p, p_c, q, z, net_in = x
+        case = self.case
+        dp_d, dp_bit, dp_a = self.losses(q)
+        bhp = p_c + case.rho * u.G * self.path.h + dp_a
+        return {"time_s": t, "q_pump": self.pump(t), "q_bpp": self.bpp(t), "q": q,
+                "q_choke": choke_flow(p_c, z, case.rho, case.choke),
+                "spp": p_p, "p_c": p_c, "bhp": bhp, "z": min(max(z, case.choke.z_min), case.choke.z_max),
+                "dp_d": dp_d, "dp_bit": dp_bit, "dp_a": dp_a,
+                "ecd": bhp / (u.G * self.path.h), "ecd_no_sbp": case.rho + dp_a / (u.G * self.path.h),
+                "net_inflow_m3": net_in}
+
+
+def simulate(case, seg, scenario, controller="none", name="", max_step=None, method=None,
+             progress=None, cancel=None):
     """
     Run one dynamic scenario.
 
-    case      : Case (SI units)
-    seg       : segment table
-    scenario  : dict from scenarios.yaml
-    progress  : optional function(fraction) to show progress
-
-    Returns a dict: 'timeseries' (DataFrame, one row per time step),
-    'profiles' (pressure vs depth every few seconds), 'metrics', 'events'.
+    scenario   : dict from config/scenarios.yaml (schedules of [time_s, value])
+                   duration_s, events_s, pump_gpm, bpp_gpm,
+                   choke_change (added to z0), target_change_bar (added to the target)
+    controller : "none" (choke command from the schedule), "P", "PI" or "PID"
+    progress   : optional function(fraction); cancel: optional function() -> True to stop
     """
-    dt = case.dyn["dt"]
     duration = float(scenario["duration_s"])
-    model = scenario.get("model", case.dyn["model"])
-    actuator = scenario.get("actuator", case.dyn["actuator"])
-    use_pid = bool(scenario.get("pid", False))
+    pump = schedule(scenario.get("pump_gpm") and [[t, v * u.GPM] for t, v in scenario["pump_gpm"]],
+                    case.q_pump)
+    bpp = schedule(scenario.get("bpp_gpm") and [[t, v * u.GPM] for t, v in scenario["bpp_gpm"]],
+                   case.q_bpp)
+    choke_change = schedule(scenario.get("choke_change"), 0.0)
+    target_change = schedule(scenario.get("target_change_bar")
+                             and [[t, v * u.BAR] for t, v in scenario["target_change_bar"]], 0.0)
+    method = method or case.solver.method
+    max_step = max_step or case.solver.max_step
+    model = FourStateModel(case, seg, pump, bpp)
 
-    # --- starting point = steady state of the case -----------------------
-    start = solve_steady(case, seg, q=schedule_value(scenario.get("pump_gpm"), 0, None) * u.GPM
-                         if scenario.get("pump_gpm") else None,
-                         opening=scenario.get("start_choke_opening"))
-    opening0 = start["opening"] if start["opening"] is not None else 0.5
-    p_choke = start["sbp"]
-    if actuator == "back_pressure" and scenario.get("back_pressure_psi"):
-        p_choke = schedule_value(scenario["back_pressure_psi"], 0, 0) * u.PSI
-    v_annulus_total = float((annulus_area(seg["hole_d"], seg["pipe_od"]) * seg["length"]).sum())
-    hydro = hydrostatic(case.rho, case.td_tvd)
-    a_disp = pipe_area(case.string[0]["od"])        # pipe area entering the well at surface
+    # --- consistent initial state = steady operating point at t = 0 ------------
+    start = solve_steady(case, seg, q=pump(0.0), q_bpp=bpp(0.0), target=case.target + target_change(0.0))
+    z0 = start.z
+    x = np.array([start.spp, start.p_c, start.q, z0, 0.0])
+    warnings = [] if start.target_reachable else [
+        f"Initial target not reachable: choke at its limit z = {z0:.3f}; BHP starts at "
+        f"{u.bar(start.bhp):.1f} bar instead of {u.bar(case.target):.1f} bar."]
 
-    # --- controller --------------------------------------------------------
+    ch, meas = case.choke, case.measurement
     pid = None
-    if use_pid:
-        if actuator == "choke":
-            pid = PID(case.pid["kp"], case.pid["ki"], case.pid["kd"],
-                      case.choke["min_opening"], case.choke["max_opening"],
-                      rate_limit=case.choke["max_speed_per_s"], reverse=True, scale=u.BAR,
-                      filter_time=case.pid["derivative_filter_s"])
-            pid.reset(opening0)
+    if controller != "none":
+        pid = PID(controller_gains(case.pid, controller), z0, ch.z_min, ch.z_max, meas.sample_time)
+    rng = np.random.default_rng(meas.seed)
+
+    ts_s = meas.sample_time
+    n = int(np.ceil(duration / ts_s - 1e-9))
+    hist_t, hist_bhp = [0.0], [start.bhp]           # true BHP history (for the measurement delay)
+    cmd_t, cmd_z = [], []                           # command history (for the actuator dead time)
+    rows, n_rhs, failures = [], 0, 0
+    row = model.outputs(0.0, x)
+
+    for k in range(n + 1):
+        t = k * ts_s
+        if cancel and cancel():
+            raise Cancelled()
+        # measurement: delayed, sampled (zero-order hold until the next sample), optional noise
+        bhp_m = float(np.interp(t - meas.delay, hist_t, hist_bhp))
+        if meas.noise_std > 0:
+            bhp_m += rng.normal(0.0, meas.noise_std)
+        target = case.target + target_change(t)
+        if pid:
+            z_cmd = pid.update(target - bhp_m)
+            terms = pid.terms
         else:
-            pid = PID(case.pid["bp_kp"] * u.BAR, case.pid["bp_ki"] * u.BAR, 0.0,
-                      0.0, case.dyn["bp_max"], scale=u.BAR)
-            pid.reset(p_choke)
+            z_cmd = min(max(z0 + choke_change(t), ch.z_min), ch.z_max)
+            terms = {"p": np.nan, "i": np.nan, "d": np.nan, "u_unsat": np.nan, "z_unsat": z_cmd}
+        cmd_t.append(t)
+        cmd_z.append(z_cmd)
+        i_cmd = max(int(np.searchsorted(cmd_t, t - case.actuator.dead_time + 1e-9, side="right")) - 1, 0)
+        z_applied = cmd_z[i_cmd]
 
-    def target_at(t):
-        ppg_points = scenario.get("target_ppg")
-        if ppg_points:
-            return u.emw_to_pressure(schedule_value(ppg_points, t, 0), case.td_tvd)
-        return case.target
+        row.update({"bhp_measured": bhp_m, "target": target, "z_cmd": z_cmd, "z_unsat": terms["z_unsat"],
+                    "pid_p": terms["p"], "pid_i": terms["i"], "pid_d": terms["d"],
+                    "u_unsat": terms["u_unsat"], "z_applied": z_applied})
+        rows.append(row)
+        if k == n:
+            break
 
-    friction_cache = {}
-
-    def friction_at(q, v_pipe):
-        """
-        Friction losses for flow q and pipe speed (cached: many steps repeat).
-
-        A Bingham fluid needs the yield-point pressure even at a tiny flow, so
-        friction would jump to zero in one step when the pumps stop. Below
-        `low_flow` the friction is therefore reduced linearly to zero
-        (smoothing; in reality the mud gels and the change is gradual).
-        """
-        low_flow = case.low_flow
-        scale = 1.0
-        if 0 < abs(q) < low_flow and abs(v_pipe) < 1e-9:
-            scale, q = abs(q) / low_flow, low_flow * np.sign(q)
-        key = (round(q, 7), round(v_pipe, 4))
-        if key not in friction_cache:
-            fl = friction_losses(case, seg, q, v_pipe)
-            friction_cache[key] = (fl["dp_annulus"].sum(),
-                                   fl["dp_string"].sum() + fl["dp_bit"])
-        return tuple(scale * f for f in friction_cache[key])
-
-    rows, profiles, events = [], [], []
-    opening = opening0
-    sbp_command = p_choke
-    last_status, next_profile = None, 0.0
-    bhp = start["bhp"]
-    n_steps = int(round(duration / dt))
-
-    for k in range(n_steps + 1):
-        t = k * dt
-        # 1. operating conditions from the schedules
-        q = max(schedule_value(scenario.get("pump_gpm"), t, case.pump_rate / u.GPM), 0) * u.GPM
-        q_bpp = max(schedule_value(scenario.get("bp_pump_gpm"), t, case.bp_pump_rate / u.GPM), 0) * u.GPM
-        v_pipe = schedule_value(scenario.get("pipe_velocity_m_s"), t, case.pipe_velocity)
-        target = target_at(t)
-
-        # 2. actuator: PID or schedule (with the choke speed limit)
-        if actuator == "choke":
-            if pid and k > 0:
-                opening = pid.update(target, bhp, dt)
-            else:
-                wanted = opening0 + schedule_value(scenario.get("choke_change"), t, 0.0)
-                max_step = case.choke["max_speed_per_s"] * dt
-                opening = min(max(wanted, opening - max_step), opening + max_step)
-                opening = min(max(opening, case.choke["min_opening"]), case.choke["max_opening"])
-        else:
-            if pid and k > 0:
-                sbp_command = pid.update(target, bhp, dt)
-            else:
-                sbp_command = schedule_value(scenario.get("back_pressure_psi"), t,
-                                             start["sbp"] / u.PSI) * u.PSI
-
-        # 3. hydraulics
-        f_annulus, f_inside = friction_at(q, v_pipe)
-        q_in = max(q + q_bpp + v_pipe * a_disp, 0.0)
-        if k > 0:
-            p_choke = update_choke_pressure(p_choke, q_in, opening, sbp_command, dt, case,
-                                            v_annulus_total, model, actuator)
-        q_choke = choke_flow(p_choke, opening, case.rho, case.choke) if actuator == "choke" else q_in
-        bhp = p_choke + hydro + f_annulus
-        spp = p_choke + f_annulus + f_inside
-        status = window_status(bhp, case)
-
-        # 4. store results
-        rows.append({
-            "time_s": t, "pump_rate": q, "bp_pump_rate": q_bpp, "pipe_velocity": v_pipe,
-            "choke_opening": opening if actuator == "choke" else np.nan,
-            "sbp_command": sbp_command if actuator == "back_pressure" else np.nan,
-            "choke_flow": q_choke, "sbp": p_choke, "spp": spp, "bhp": bhp,
-            "annulus_friction": f_annulus,
-            "ecd": case.rho + f_annulus / (u.G * case.td_tvd),
-            "emw": bhp / (u.G * case.td_tvd),
-            "target": target, "pore": case.pore, "fracture": case.frac,
-            "status": status, "error": target - bhp,
-            "pid_p": pid.p_term if pid else np.nan, "pid_i": pid.i_term if pid else np.nan,
-            "pid_d": pid.d_term if pid else np.nan,
-        })
-        if status != last_status and last_status is not None:
-            events.append(f"t = {t:.1f} s: window status {last_status} -> {status}")
-        last_status = status
-        if t >= next_profile - 1e-9:
-            prof = solve_steady(case, seg, q=q, sbp=p_choke, v_pipe=v_pipe)["profile"]
-            prof.insert(0, "time_s", t)
-            profiles.append(prof)
-            next_profile += case.dyn["profile_every"]
-        if progress and k % max(1, n_steps // 50) == 0:
-            progress(k / n_steps)
+        sol = solve_ivp(model.rhs, (t, t + ts_s), x, method=method, args=(z_applied,),
+                        rtol=case.solver.rtol, atol=case.solver.atol, max_step=max_step)
+        n_rhs += sol.nfev
+        if not sol.success:
+            failures += 1
+        x = sol.y[:, -1]
+        row = model.outputs(t + ts_s, x)
+        hist_t.append(t + ts_s)
+        hist_bhp.append(row["bhp"])
+        if progress and k % max(1, n // 50) == 0:
+            progress(k / n)
 
     ts = pd.DataFrame(rows)
-    events_s = scenario.get("events_s", [0])
-    metrics = control_metrics(ts, case.pid["settling_band_psi"] * u.PSI, events_s)
-    return {"timeseries": ts, "profiles": pd.concat(profiles, ignore_index=True),
-            "metrics": metrics, "events": events, "actuator": actuator, "pid": use_pid,
-            "title": scenario.get("title", ""), "description": scenario.get("description", "")}
+    ts["pore"], ts["frac"] = case.pore, case.frac
+    ts["safe_low"], ts["safe_high"] = case.safe_low, case.safe_high
+    ts["status"] = [window_status(b, case) for b in ts["bhp"]]
+
+    # mass balance:  stored volume change = net volume in
+    path = model.path
+    stored = (path.v_d * (ts["spp"] - start.spp) + path.v_a * (ts["p_c"] - start.p_c)) / case.beta_eff
+    residual = stored - ts["net_inflow_m3"]
+    circulated = np.trapezoid(ts["q_pump"] + ts["q_bpp"], ts["time_s"])
+    ts["mass_residual_m3"] = residual
+    mass = {"max_residual_m3": float(residual.abs().max()),
+            "circulated_m3": float(circulated),
+            "relative_percent": float(residual.abs().max() / max(circulated, path.v_d + path.v_a) * 100)}
+    if failures:
+        warnings.append(f"Solver reported {failures} failed interval(s).")
+
+    events = scenario.get("events_s") or [0.0]
+    return SimulationResult(
+        name=name, title=scenario.get("title", name), controller=controller, timeseries=ts,
+        metrics=performance_metrics(ts, events[0], case.criteria), mass_balance=mass,
+        solver={"method": method, "rtol": case.solver.rtol, "atol": case.solver.atol,
+                "max_step_s": max_step, "sample_time_s": ts_s, "rhs_evaluations": n_rhs,
+                "failed_intervals": failures},
+        initial=start, warnings=warnings)
 
 
-def update_choke_pressure(p_choke, q_in, opening, sbp_command, dt, case, volume, model, actuator):
-    """Advance the surface (choke) pressure by one time step."""
-    if actuator == "back_pressure":
-        # first-order actuator:  dp/dt = (command - p) / tau  (exact solution over dt)
-        return sbp_command + (p_choke - sbp_command) * math.exp(-dt / case.dyn["bp_tau"])
-    if model == "quasi_steady":
-        return choke_pressure_drop(q_in, opening, case.rho, case.choke)
-    # lumped model: dp/dt = beta/V (Q_in - Q_choke), 20 small Euler steps for stability
-    beta = case.dyn["bulk_modulus"]
-    h = dt / 20
-    for _ in range(20):
-        dp = beta / volume * (q_in - choke_flow(p_choke, opening, case.rho, case.choke)) * h
-        p_choke = max(p_choke + dp, 0.0)
-    return p_choke
+def check_convergence(case, seg, scenario, result, progress=None, cancel=None):
+    """
+    Numerical convergence (proposal 4-2-5): repeat the run with half the
+    integration step and compare the BHP RMSE (relative to the target).
+
+        change [%] = |RMSE_h - RMSE_h/2| / max(RMSE_h/2, 0.1 % of target) x 100
+
+    The floor of 0.1 % of the target avoids dividing by ~0 when BHP stays on target.
+    """
+    half = simulate(case, seg, scenario, result.controller, result.name,
+                    max_step=result.solver["max_step_s"] / 2, method=result.solver["method"],
+                    progress=progress, cancel=cancel)
+    rmse_h, rmse_half = result.metrics["rmse"], half.metrics["rmse"]
+    floor = 1e-3 * abs(case.target)
+    change = abs(rmse_h - rmse_half) / max(rmse_half, floor) * 100
+    diff = np.abs(result.timeseries["bhp"].values - half.timeseries["bhp"].values).max()
+    result.convergence = {"rmse_h": rmse_h, "rmse_half": rmse_half, "change_percent": change,
+                          "max_bhp_difference": float(diff), "limit_percent": case.solver.convergence_limit,
+                          "passed": change < case.solver.convergence_limit}
+    if not result.convergence["passed"]:
+        result.warnings.append(f"Convergence warning: BHP RMSE changed {change:.3f} % when the step "
+                               f"was halved (limit {case.solver.convergence_limit} %).")
+    return result.convergence
+
+
+def steady_state_residual(case, seg):
+    """
+    Level-1 check: at the steady operating point all time derivatives of the
+    model must be ~0 ("setting the derivatives to zero gives the steady
+    hydraulics"). Returns each derivative scaled by its natural size per second.
+    """
+    start = solve_steady(case, seg)
+    model = FourStateModel(case, seg, lambda t: case.q_pump, lambda t: case.q_bpp)
+    d = model.rhs(0.0, [start.spp, start.p_c, start.q, start.z, 0.0], start.z)
+    return {"dp_p/dt / SPP": d[0] / start.spp, "dp_c/dt / p_c": d[1] / max(start.p_c, 1.0),
+            "dq/dt / q": d[2] / max(start.q, 1e-9), "dz/dt": d[3]}
+
+
+def depth_profiles(case, seg, ts, times):
+    """Annulus and string pressure profiles at chosen times (from q and p_c of the run)."""
+    geo = flow_geometry(seg)
+    frames = []
+    for t in times:
+        row = ts.iloc[int(np.argmin(np.abs(ts["time_s"].values - t)))]
+        loss = pressure_losses(case, geo, row["q"])
+        prof = pressure_profile(case, seg, loss, row["p_c"], row["spp"])
+        prof.insert(0, "time_s", row["time_s"])
+        frames.append(prof)
+    return pd.concat(frames, ignore_index=True)

@@ -1,68 +1,86 @@
 # ======================================================================
-# BASE CASE  (synthetic demonstration well — NOT real field data)
-# Units are written in every key name: _m, _in, _ppg, _cp, _gpm, _psi ...
-# The program converts everything to SI units when it reads this file.
+# BASE CASE  (synthetic demonstration well - NOT field data)
+# Canonical input schema of the simulator (the proposal, section 4-2-3).
+# Units are written in every key name: _m, _in, _ppg, _cp, _gpm, _psi, _pa, _s ...
+# The program converts everything to SI once, in mpd/well.py:build_case().
+# Values marked [confirm] are assumptions the proposal says must be confirmed.
 # ======================================================================
 name: Base case - J-type MPD well (synthetic)
 
-well:
-  survey_file: data/trajectory_example.csv   # columns: md_m, tvd_m, inclination_deg, azimuth_deg
-  hole_sections:                             # from surface to TD
+well:                                        # 1. geometry
+  survey_file: data/trajectory_example.csv   # md_m, tvd_m, inclination_deg, azimuth_deg
+  hole_sections:                             # surface -> TD, concentric annulus
     - {name: Casing 9-5/8 in, top_m: 0, bottom_m: 1800, diameter_in: 8.681}
     - {name: Open hole 8-1/2 in, top_m: 1800, bottom_m: 3500, diameter_in: 8.5}
-  drill_string:                              # from surface to bit
+  drill_string:                              # surface -> bit
     - {name: Drill pipe 5 in, type: drill_pipe, length_m: 3300, od_in: 5.0, id_in: 4.276}
     - {name: BHA 6-1/2 in collars, type: bha, length_m: 200, od_in: 6.5, id_in: 2.8125}
   bit:
-    nozzles_32nd: [13, 13, 13, 13]
-    discharge_coefficient: 0.95
+    nozzles_32nd: [13, 13, 13, 13]           # A_n = total nozzle area
+    discharge_coefficient: 0.95              # C_dn
 
-mud:                       # Bingham Plastic fluid
-  density_ppg: 10.0
-  pv_cp: 20.0
-  yp_lbf100ft2: 15.0
-  gel_10min_lbf100ft2: 12.0
+mud:                                         # 2. fluid (Bingham Plastic)
+  density_ppg: 10.0                          # rho
+  pv_cp: 20.0                                # mu_p
+  yp_lbf100ft2: 15.0                         # tau_y
 
-operation:
-  pump_rate_gpm: 500
-  back_pressure_from: choke    # "choke" (choke equation) or "fixed" (use back_pressure_psi)
-  back_pressure_psi: 150
-  choke_opening: auto          # number 0..1, or "auto" = opening that gives the target BHP
-  bp_pump_gpm: 0               # MPD back-pressure pump (flows only through the choke)
-  pipe_velocity_m_s: 0.0       # + down (surge), - up (swab)
-  clinging_constant: 0.45
+compressibility:                             # 1/beta_eff = 1/beta_f + 1/beta_w
+  fluid_bulk_modulus_pa: 1.5e9               # beta_f, water-based mud [confirm]
+  wall_bulk_modulus_pa: 3.4e10               # beta_w ~ 2 E t / D: steel E = 200 GPa, 5-in pipe t = 0.362 in, D = 4.276 in [confirm]
 
-pressure_window:               # at the bottom of the well, as equivalent mud weight
-  pore_ppg: 10.4
-  fracture_ppg: 11.8
-  target_ppg: 11.0
-  warning_margin_psi: 100
+operation:                                   # 4. operating conditions
+  pump_rate_gpm: 500                         # q_pump
+  bpp_rate_gpm: 0                            # q_bpp, back-pressure pump (known input, not a control variable)
 
-choke:                         # Q[gpm] = Cv * sqrt(dP[psi] / SG),  Cv = Cv_closed + (Cv_max - Cv_closed) * opening
-  cv_max: 100.0
-  cv_closed: 1.0
-  min_opening: 0.02
+pressure_window:                             # at TD, as equivalent mud weight
+  pore_ppg: 10.4                             # p_pore
+  fracture_ppg: 11.8                         # p_frac
+  safety_margin_psi: 100                     # delta:  p_pore + delta <= BHP <= p_frac - delta
+  target_ppg: midpoint                       # "midpoint" = (p_pore + p_frac) / 2 (proposal), or a number
+
+choke:                                       # 3. equipment: q_c = C_d A_c(z) sqrt(2 dp+ / rho)
+  max_area_in2: 3.1416                       # A_max (2-in bore)  [synthetic]
+  discharge_coefficient: 0.7                 # C_d  [synthetic]
+  characteristic: linear                     # linear (baseline) or equal_percentage (sensitivity only)
+  rangeability: 50                           # R of the equal-percentage curve
+  min_opening: 0.01                          # z_min (proposal)
   max_opening: 1.0
-  max_speed_per_s: 0.05        # how fast the choke can move [fraction per second]
+  downstream_pressure_psi: 0                 # p_0 (atmosphere / separator, gauge)
+  max_working_pressure_psi: 1500             # epsilon = 1e-3 x this (smooth dp+)
 
-dynamics:
-  model: lumped                # "lumped" (with mud compressibility) or "quasi_steady"
-  actuator: choke              # "choke" or "back_pressure"
-  time_step_s: 0.1
-  bulk_modulus_pa: 1.5e9       # mud compressibility (calibrate!)
-  bp_time_constant_s: 2.0      # response time of the back-pressure actuator
-  bp_max_psi: 1500
-  profile_every_s: 10
+actuator:                                    # dz/dt = r_max tanh(((z_cmd - z)/tau_a) / r_max)
+  time_constant_s: 1.0                       # tau_a  [confirm]
+  max_rate_per_s: 0.05                       # r_max: full stroke in 20 s  [confirm]
+  dead_time_s: 0.0                           # theta_a (pure delay on the command)
 
-pid:                           # gains for choke actuation: [fraction of opening per bar of error]
-  kp: 0.1
-  ki: 0.05
-  kd: 0.0
-  bp_kp: 0.6                   # gains for back-pressure actuation: [bar of SBP per bar of error]
-  bp_ki: 0.3
-  derivative_filter_s: 1.0
-  settling_band_psi: 15
+measurement:                                 # BHP_m(t) = BHP(t - theta_m), sampled every T_s
+  delay_s: 0.5                               # theta_m  [confirm]
+  sample_time_s: 0.2                         # T_s  [confirm]
+  noise_std_psi: 0                           # off in the base model (proposal)
+  noise_seed: 1
+
+controller:                                  # reverse-acting PID: z_cmd = z0 - u, e = target - BHP_m
+  kp_per_bar: 0.08                           # tuned on S3 with `python main.py --tune` (README "PID tuning"):
+  ki_per_bar_s: 0.008                        #   largest calm Kp, then the Ki with the lowest RMSE;
+  kd_s_per_bar: 0.0                          #   Kd = 0 because PI overshoot (1.1 %) < 5 % -> PID = PI
+  derivative_filter_n: 8                     # derivative filter time constant = (Kd/Kp) / N
+  tracking_time_s: auto                      # back-calculation T_t; auto = Ti = Kp/Ki
+
+solver:
+  method: Radau                              # stiff solver (proposal); RK45 for comparison
+  rtol: 1.0e-6
+  atol: 1.0e-9
+  max_step_s: 0.2                            # halved in the convergence check
+  convergence_limit_percent: 0.1             # BHP RMSE change when the step is halved
 
 numerics:
   segment_length_m: 30
-  low_flow_gpm: 50             # dynamic model: friction goes linearly to 0 below this flow
+  friction_model: api_rp13d                  # api_rp13d (proposal) or exact_bingham (comparison)
+  flow_smoothing_fraction: 1.0e-4            # q_eps = this x pump rate; friction x tanh(q / q_eps)
+  regime_transition_width: 0.1               # laminar -> turbulent over v_c ... 1.1 v_c (no jump in friction)
+
+criteria:                                    # proposal's preliminary acceptance targets
+  max_overshoot_percent: 5
+  max_settling_time_s: 60
+  settling_band_percent: 2
+  min_time_in_window_percent: 95

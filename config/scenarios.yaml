@@ -1,81 +1,89 @@
 # ======================================================================
-# DYNAMIC SCENARIOS
+# PROPOSAL SCENARIOS S0 - S5  (proposal 4-2-9)
 # Schedules are lists of [time_s, value]; values change linearly between
-# points and stay constant after the last point.
-#   pump_gpm, bp_pump_gpm, choke_change (added to the starting opening),
-#   back_pressure_psi, pipe_velocity_m_s, target_ppg
-# events_s: times of the disturbances (used for settling time etc.)
+# points and stay constant outside them.
+#   pump_gpm            rig pump flow q_pump
+#   bpp_gpm             back-pressure pump flow q_bpp (known input)
+#   choke_change        added to the starting opening z0 (open loop only)
+#   target_change_bar   added to the target BHP
+# events_s: time of the first disturbance (settling time is measured from it)
+# controller: none (fixed choke / scheduled command), P, PI or PID
+# kind: steady | dynamic | compare | sensitivity
+# All times t1..t4 and flows are assumptions for the synthetic well.
 # ======================================================================
-constant_pump_rate:
-  title: "1 - Constant pump rate"
-  description: Nothing changes; BHP must stay constant (equilibrium check).
-  duration_s: 120
-  events_s: [0]
+S0:
+  kind: steady
+  title: "S0 - Steady operation at three pump rates"
+  description: >-
+    Steady hydraulics at 350, 500 and 650 gpm with the choke holding the target.
+    The dynamic model is also started at each point and must stay there
+    (all time derivatives zero).
+  pump_rates_gpm: [350, 500, 650]
+  hold_s: 30
 
-pump_rate_increase:
-  title: "2 - Pump rate increase"
-  description: Pump rate 500 -> 650 gpm with a fixed choke.
+S1:
+  kind: dynamic
+  title: "S1 - Pump-rate step"
+  description: >-
+    Pump flow 500 -> 650 gpm at t = 30 s (1-s ramp) with the choke fixed at z0.
+    Shows the transient of BHP and stand-pipe pressure (open loop).
   duration_s: 240
   events_s: [30]
-  pump_gpm: [[0, 500], [30, 500], [60, 650]]
+  controller: none
+  pump_gpm: [[0, 500], [30, 500], [31, 650]]
 
-pump_rate_decrease:
-  title: "3 - Pump rate decrease"
-  description: Pump rate 500 -> 350 gpm with a fixed choke.
-  duration_s: 240
-  events_s: [30]
-  pump_gpm: [[0, 500], [30, 500], [60, 350]]
-
-pump_start:
-  title: "4 - Pump start"
-  description: Pumps start from 0 to 500 gpm; the choke is fixed at 43 % open.
-  duration_s: 300
-  events_s: [20]
-  start_choke_opening: 0.43
-  pump_gpm: [[0, 0], [20, 0], [80, 500]]
-
-pump_stop:
-  title: "5 - Pump stop"
-  description: Pumps stop with a fixed choke and no back-pressure pump - friction pressure is lost.
-  duration_s: 300
-  events_s: [20]
-  pump_gpm: [[0, 500], [20, 500], [80, 0]]
-
-choke_opening:
-  title: "6 - Choke opening"
-  description: The choke opens by 15 % - BHP falls.
+S2:
+  kind: dynamic
+  title: "S2 - Choke step (open loop)"
+  description: >-
+    Choke command closed by 0.05 at t = 30 s, pumps constant. The choke step is
+    used (not a target step) because without a controller a target change does
+    not move BHP; this isolates the choke -> BHP response of the well.
+    The target-step variant with PID is S2b.
   duration_s: 180
   events_s: [30]
-  choke_change: [[0, 0], [30, 0], [35, 0.15]]
+  controller: none
+  choke_change: [[0, 0], [30, 0], [30.2, -0.05]]
 
-choke_closing:
-  title: "7 - Choke closing"
-  description: The choke closes by 10 % - BHP rises.
+S2b:
+  kind: dynamic
+  title: "S2b - Target step with PID (variant of S2)"
+  description: Target BHP raised by 5 bar at t = 30 s; the PID moves the choke.
   duration_s: 180
   events_s: [30]
-  choke_change: [[0, 0], [30, 0], [35, -0.10]]
+  controller: PID
+  target_change_bar: [[0, 0], [30, 0], [30.2, 5]]
 
-back_pressure_change:
-  title: "8 - Back-pressure change"
-  description: Surface back pressure is raised from 150 to 300 psi (back-pressure actuator).
-  duration_s: 180
+S3:
+  kind: dynamic
+  title: "S3 - Pipe connection, no controller"
+  description: >-
+    Pump q0 = 500 gpm ramps to 0 between t1 = 30 s and t2 = 90 s, stays 0 until
+    t3 = 270 s and ramps back to q0 by t4 = 330 s. The back-pressure pump ramps
+    up to 200 gpm while the rig pump ramps down (and back). Choke fixed at z0.
+  duration_s: 480
   events_s: [30]
-  actuator: back_pressure
-  back_pressure_psi: [[0, 150], [30, 150], [33, 300]]
-
-pipe_movement:
-  title: "9 - Pipe movement (surge / swab)"
-  description: Pipe runs in at 0.5 m/s (surge), then pulls out at 0.5 m/s (swab).
-  duration_s: 240
-  events_s: [30]
-  pipe_velocity_m_s: [[0, 0], [30, 0], [35, 0.5], [75, 0.5], [80, 0], [120, 0], [125, -0.5], [165, -0.5], [170, 0]]
-
-pid_control:
-  title: "10 - PID control of BHP"
-  description: Connection - pumps stop and restart while the back-pressure pump runs; then the target BHP is raised. PID moves the choke.
-  duration_s: 600
-  events_s: [30, 270, 450]
-  pid: true
+  controller: none
   pump_gpm: [[0, 500], [30, 500], [90, 0], [270, 0], [330, 500]]
-  bp_pump_gpm: [[0, 0], [20, 0], [30, 150], [360, 150], [380, 0]]
-  target_ppg: [[0, 11.0], [450, 11.0], [451, 11.15]]
+  bpp_gpm: [[0, 0], [30, 0], [90, 200], [270, 200], [330, 0]]
+
+S4:
+  kind: compare
+  title: "S4 - Pipe connection with control (fixed / P / PI / PID)"
+  description: >-
+    The S3 connection again, now with the choke moved by a controller. Same
+    disturbance and initial state for all four runs.
+  schedule_from: S3
+  controllers: [none, P, PI, PID]
+
+S5:
+  kind: sensitivity
+  title: "S5 - Sensitivity of the S4 PID run (+/-20 %)"
+  description: >-
+    The S4 PID run repeated with each parameter changed by -20 % and +20 %
+    (gains kept). The equal-percentage choke curve is also tried.
+  schedule_from: S3
+  controller: PID
+  change_percent: 20
+  parameters: [beta_eff, tau_y, mu_p, choke_cd, choke_area]
+  equal_percentage: true

@@ -1,0 +1,2 @@
+# Copy to transient_reference.csv. Digitised curve, one row per point.
+time_s,bhp_normalised,source,figure,data_type

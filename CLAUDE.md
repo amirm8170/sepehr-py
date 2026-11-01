@@ -1,37 +1,35 @@
 # CLAUDE.md — MPD well hydraulics simulator (thesis project)
 
 ## Purpose
-- University thesis project: Stage A steady-state Bingham hydraulics → Stage B dynamic MPD + PID BHP control.
-- User presents the CODE to teachers → keep code SIMPLE (plain functions, few classes, clear comments). The UI DESIGN must look professional.
-- All bundled data are synthetic — never claim validation.
-- `README_FA.md` = full Persian presentation guide with Mermaid flowcharts; `GUIDE_FA.md` = Persian layered ("onion") walkthrough of every file/function. Keep both in sync with code changes (numbers, test count, file list).
+- M.Sc. thesis (Univ. of Tehran). **Approved proposal = specification** (`~/Downloads/Sepehr Mashayekhfar Prop.Final.pdf`, Persian): 1-D single-phase CBHP model, 4-state dynamics, orifice choke + actuator, reverse PID, scenarios S0–S5, 3-level validation. Proposal wins over older docs.
+- User presents the CODE to teachers → keep it SIMPLE (plain functions, small dataclasses, comments with equations). UI must look professional.
+- All bundled data synthetic — never claim validation; levels 2/3 stay "pending reference data" until sourced data exist in `data/reference/`.
+- Docs to keep in sync: `README.md` (EN, equations + "Assumptions and decisions"), `README_FA.md` (Persian guide, Mermaid), `GUIDE_FA.md` (Persian onion walkthrough). Update numbers, test count, file list.
 
 ## Stack / run
-- Python 3.12 from `uv` (Apple's Python 3.9 has Tk 8.5 that crashes on macOS 26). `.venv` built from `~/.local/share/uv/python/cpython-3.12-…/bin/python3.12`.
-- `.venv/bin/python app.py` (Tkinter + matplotlib desktop window; user rejected web UI and PySide6).
-- `.venv/bin/python main.py [--scenario name|all|none] [--sensitivity] [--validate] [--case file.yaml|file.csv] [--variant name] [--no-fix]` → `outputs/` (gitignored).
-- `.venv/bin/pytest` (42 tests, ~1 min). `data/hand_calculation.py` regenerates `data/validation_reference.csv`.
-- `archive/advanced_version.zip` = old large version (PySide6 GUI, Streamlit, 3-state ODE); not used.
+- Python 3.12 from `uv` (Apple's 3.9/Tk 8.5 crashes on macOS 26). `.venv` from `~/.local/share/uv/python/cpython-3.12-…/bin/python3.12`. Deps: numpy pandas scipy matplotlib pyyaml pytest (no pydantic).
+- `.venv/bin/python app.py` (Tkinter + matplotlib; user rejected web UI and PySide6).
+- `.venv/bin/python main.py [--scenario S0..S5|all|none] [--s5] [--validate] [--tune] [--case file.yaml|.csv] [--variant name]` → `outputs/`.
+- `.venv/bin/pytest` (76 tests, ~50 s). `data/hand_calculation.py` regenerates `data/validation_reference.csv`.
+- `archive/advanced_version.zip` = old large version, unused.
 
-## Code layout (~2600 lines)
-- `mpd/units.py` constants; `mpd/well.py` load_config → build_case (Case dataclass, SI) → make_segments (DataFrame, one row per segment); min-curvature.
-- `mpd/library.py` complete-case CSV (user requirement: ONE file holds EVERY input): rows `parameter` = dotted path (list items numbered from 1, lists in one cell joined by ';', survey inlined), `unit`/`description` for humans, then one column per case; first case complete, empty cell in later cases = first case. TEMPLATE (from base_case.yaml) defines known params and list-typed cells. Example `data/case_library.csv` (102 rows, 10 cases, each shows an auto-fix path); regenerate via write_case_csv.
-- `mpd/autofix.py` auto_fix(config) → (copy, report[{problem, why, done, how}]). "Right place" = pore+margin ≤ BHP ≤ frac−margin, and BHP = target with auto choke. One change per loop (max 6): target into window → fixed SBP → manual choke→auto → BP pump (sized for choke 10 % open) / stop BP pump → lighter mud (if ρgTVD ≥ target) → lower pump rate; safe-but-off-target → target = reachable BHP + advice. User wants every fix explained (why + how on the rig).
-- `mpd/hydraulics.py` friction() (Buckingham-Reiner / slot laminar, Hanks Re_c, Blasius), bit, choke (Cv→SI, linear below 1e4 Pa), solve_steady() returns dict + `segments` + `profile`.
-- `mpd/dynamics.py` PID class + simulate(): 1-state lumped model dp_c/dt = β/V (Q_in − Q_choke); friction per step from friction_losses (cached), linear to 0 below `numerics.low_flow_gpm` (Bingham yield jump otherwise); actuators choke / back_pressure; model lumped / quasi_steady.
-- `mpd/analysis.py` control_metrics (per event), sensitivity/sweep on the config dict, validate().
-- `mpd/plots.py` all matplotlib charts (draw on a given Figure; used by CLI and app).
-- `app.py` one App(tk.Tk): dark sidebar nav + 7 pages (tkraise), card()/kpi()/chart()/table() helpers, ttk clam styles. Every input change goes through load_case() → auto_fix (applied if 'Auto-fix result' checkbox `fix_on`, else shown as suggestions) → build_case; report in the yellow banner on the steady page. Input file page: Upload CSV / Load example / Export current case / case combobox + 'Use this case'.
+## Code layout (~4300 lines)
+- `mpd/well.py` load_config → migrate_config (old Cv/1-state files) → config_errors (all physical checks, no changes) → build_case (Case + ChokeSpec/ActuatorSpec/MeasurementSpec/PIDGains/SolverSpec, SI) → make_segments → flow_path (V_d, V_a, M).
+- `mpd/hydraulics.py` API RP13D/Bourgoyne friction (default) + exact_bingham (comparison only); friction_gradient with regime band; pressure_losses (× tanh(q/q_eps)); solve_steady → SteadyResult (holds target via brentq z0 unless z or p_c given).
+- `mpd/choke.py` orifice q_c, smooth dp+, inverse, opening_for, actuator_rate. `mpd/controller.py` PID (reverse, D filter, back-calculation), controller_gains P/PI/PID.
+- `mpd/dynamics.py` FourStateModel.rhs (+5th bookkeeping state for mass balance), simulate (solve_ivp per T_s, ZOH, θm delay, θa dead time, optional seeded noise, cancel/progress callbacks) → SimulationResult; check_convergence (halve max_step); steady_state_residual; depth_profiles.
+- `mpd/metrics.py` overshoot/settling ±2 %/max dev/RMSE/MAPE/% in window + PASS/FAIL criteria. `mpd/scenarios.py` runs S0–S5 from `config/scenarios.yaml` (S4/S5 reuse S3 via schedule_from). `mpd/validation.py` levels 1–3. `mpd/analysis.py` steady sensitivity/sweep + tune_pid. `mpd/suggestions.py` explained suggestions with `changes` dict, applied only by user. `mpd/library.py` one-CSV case library (column title = case name; legacy CSV migrated). `mpd/extensions.py` surge/swab — out of scope, unused. `mpd/plots.py` all charts.
+- `app.py` 6 pages (Project & Case, Steady, Dynamic, Control & Scenarios, Sensitivity, Validation); run_task = background thread + queue + footer progress/Cancel; UI has no physics.
 
 ## Conventions / gotchas
-- Config YAML in oilfield units with unit in key names; converted once in build_case. PyYAML reads `1.5e9` as a string → wrap in float().
-- SI internally, gauge pressure; BHP at TD; SBP = annulus pressure before choke. Two ECDs: `ecd` (no SBP) and `emw` (with SBP).
-- PID gains Kp 0.1, Ki 0.05 (per bar) tuned on synthetic scenario 10.
-- Tk layout: pack the fixed-width side panel BEFORE the expanding chart card, or it gets squeezed.
-- Screenshots for checking the UI: bring window to front via osascript + `-topmost`, then `screencapture -R`.
+- YAML in oilfield units, unit in key names; SI inside; gauge pressure; BHP at TD. `target_ppg: midpoint` default. PyYAML reads `1.5e9` as str → float().
+- Friction velocity units: v_c formula ft/min, gradients ft/s (proposal text says ft/min everywhere — flagged for supervisor).
+- Regime jump at v_c traps the ODE (sliding mode, runs never finish) → keep `regime_transition_width` > 0 for dynamics.
+- Tuned gains Kp 0.08 /bar, Ki 0.008 /(bar s), Kd 0 (→ PID = PI in S4). Re-tune with `main.py --tune` after model changes.
+- numpy scalars break yaml.safe_dump → store plain float in config dicts.
+- Tk: pack fixed side panels before expanding cards; long labels need `autowrap()`; per-axis legends squash stacked plots → figure legend.
+- Screenshots: `screencapture -l <CGWindowID>` (find ID with Quartz in a scratch venv, window name starts "MPD"); `-R` grabs whatever is on top. Headless check: drive App() and pump `update()` while `task_busy`.
 - Tests must compare with independent results (hand calcs, analytic solutions, textbook formulas).
-- numpy scalars break yaml.safe_dump of config_data → always store plain float in the config dict.
-- screencapture may fail ("could not create image from rect") without Screen Recording permission → verify UI headlessly by driving App() and reading widget state.
 
 ## Current state
-- Base case: BHP 380.4 bar, SPP 172.6 bar, SBP 11.1 bar (auto choke 0.426). Validation demo: annulus −9 % (exact vs linearised slot), others < 1.5 %.
+- Base: BHP 383.8 bar (11.10 ppg), SPP 176.1, p_c 14.4, z0 0.454. S3 open loop −20.9 bar (60 % in window); S4 PI max dev 4.3 bar, all criteria pass. L1 validation max error 0.093 %.

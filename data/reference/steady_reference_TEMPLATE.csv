@@ -1,0 +1,2 @@
+# Copy to steady_reference.csv and replace this example line with sourced values.
+case_file,quantity,unit,p_c_psi,reference_value,data_type,source

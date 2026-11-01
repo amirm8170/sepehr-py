@@ -1,7 +1,9 @@
 """
 Case CSV: ONE file that contains EVERYTHING the simulator needs
-(well path, hole, drill string, bit, mud, operation, pressure window,
-choke, dynamics, PID, numerics) - and several muds / variants side by side.
+(well path, hole, drill string, bit, mud, compressibility, operation, pressure
+window, choke, actuator, measurement, PID, solver, numerics, criteria) - and
+several muds / variants side by side. CSV files of the old format (Cv choke)
+are converted with well.migrate_config().
 
     parameter,               unit, description,          Base WBM, OBM 10.5 ppg
     mud.density_ppg,         ppg,  Mud density,          10.0,     10.5
@@ -23,34 +25,39 @@ import io
 
 import pandas as pd
 
-from .well import ROOT, load_config, read_survey
+from .well import BASE_CASE, load_config, migrate_config, read_survey
 
 LABELS = ("parameter", "unit", "description")
-OPTIONAL = {"name", "mud.gel_10min_lbf100ft2", "operation.clinging_constant",
-            "pressure_window.warning_margin_psi", "numerics.low_flow_gpm"}
+OPTIONAL = {"name", "measurement.noise_std_psi", "measurement.noise_seed"}
+LEGACY_MARKERS = {"choke.cv_max", "dynamics.bulk_modulus_pa"}     # rows of the old (Cv, 1-state) format
 DESCRIPTIONS = {
     "name": "Case name", "survey": "Survey station: MD; TVD; inclination; azimuth",
     "hole_sections": "Hole section", "drill_string": "Drill string part",
-    "type": "drill_pipe or bha", "nozzles_32nd": "Bit nozzle sizes",
-    "discharge_coefficient": "Nozzle discharge coefficient",
-    "density_ppg": "Mud density", "pv_cp": "Plastic viscosity", "yp_lbf100ft2": "Yield point",
-    "gel_10min_lbf100ft2": "10-min gel strength", "pump_rate_gpm": "Mud pump rate",
-    "back_pressure_from": "choke (choke equation) or fixed (back_pressure_psi)",
-    "back_pressure_psi": "Back pressure (fixed mode)", "choke_opening": "0..1 or auto (reach target)",
-    "bp_pump_gpm": "MPD back-pressure pump rate", "pipe_velocity_m_s": "Pipe speed (+ down / - up)",
-    "clinging_constant": "Surge/swab clinging constant", "pore_ppg": "Pore pressure at TD (EMW)",
-    "fracture_ppg": "Fracture pressure at TD (EMW)", "target_ppg": "Target BHP (EMW)",
-    "warning_margin_psi": "Safety margin from pore and fracture", "cv_max": "Choke Cv fully open",
-    "cv_closed": "Choke Cv closed", "min_opening": "Smallest choke opening",
-    "max_opening": "Largest choke opening", "max_speed_per_s": "Choke speed limit",
-    "model": "lumped or quasi_steady", "actuator": "choke or back_pressure",
-    "time_step_s": "Time step", "bulk_modulus_pa": "Mud bulk modulus",
-    "bp_time_constant_s": "Back-pressure actuator delay", "bp_max_psi": "Largest back pressure",
-    "profile_every_s": "Depth profile every ...", "kp": "PID proportional gain (choke)",
-    "ki": "PID integral gain (choke)", "kd": "PID derivative gain (choke)",
-    "bp_kp": "PID proportional gain (back pressure)", "bp_ki": "PID integral gain (back pressure)",
-    "derivative_filter_s": "Derivative filter time", "settling_band_psi": "Settling band",
-    "segment_length_m": "Segment length", "low_flow_gpm": "Friction smoothing below this flow",
+    "type": "drill_pipe or bha", "nozzles_32nd": "Bit nozzle sizes (A_n)",
+    "discharge_coefficient": "Discharge coefficient (C_dn bit / C_d choke)",
+    "density_ppg": "Mud density rho", "pv_cp": "Plastic viscosity mu_p", "yp_lbf100ft2": "Yield stress tau_y",
+    "fluid_bulk_modulus_pa": "Fluid bulk modulus beta_f", "wall_bulk_modulus_pa": "Wall bulk modulus beta_w",
+    "pump_rate_gpm": "Rig pump flow q_pump", "bpp_rate_gpm": "Back-pressure pump flow q_bpp",
+    "pore_ppg": "Pore pressure at TD (EMW)", "fracture_ppg": "Fracture pressure at TD (EMW)",
+    "safety_margin_psi": "Safety margin delta", "target_ppg": "Target BHP (EMW) or midpoint",
+    "max_area_in2": "Choke area fully open A_max", "characteristic": "linear or equal_percentage",
+    "rangeability": "Equal-percentage rangeability R", "min_opening": "Smallest choke opening z_min",
+    "max_opening": "Largest choke opening z_max", "downstream_pressure_psi": "Pressure after the choke p_0",
+    "max_working_pressure_psi": "Choke max working pressure (eps = 1e-3 x)",
+    "time_constant_s": "Actuator time constant tau_a", "max_rate_per_s": "Actuator max rate r_max",
+    "dead_time_s": "Actuator dead time theta_a", "delay_s": "Measurement delay theta_m",
+    "sample_time_s": "Sample time T_s", "noise_std_psi": "Measurement noise (0 = off)",
+    "noise_seed": "Noise random seed", "kp_per_bar": "PID Kp", "ki_per_bar_s": "PID Ki",
+    "kd_s_per_bar": "PID Kd", "derivative_filter_n": "Derivative filter N",
+    "tracking_time_s": "Anti-windup tracking time T_t (auto = Ti)", "method": "ODE solver (Radau)",
+    "rtol": "Solver relative tolerance", "atol": "Solver absolute tolerance",
+    "max_step_s": "Solver max step", "convergence_limit_percent": "Step-halving limit",
+    "segment_length_m": "Segment length", "friction_model": "api_rp13d or exact_bingham",
+    "flow_smoothing_fraction": "q_eps / q_pump (tanh smoothing)",
+    "regime_transition_width": "Laminar-turbulent band (fraction of v_c)",
+    "max_overshoot_percent": "Criterion: overshoot", "max_settling_time_s": "Criterion: settling time",
+    "settling_band_percent": "Settling band (% of target)",
+    "min_time_in_window_percent": "Criterion: time in safe window",
 }
 
 
@@ -100,7 +107,7 @@ def generic(path):
     return ".".join("#" if p.isdigit() else p for p in path.split("."))
 
 
-TEMPLATE = {generic(p): v for p, v in flatten(complete_config(load_config(ROOT / "config" / "base_case.yaml")))}
+TEMPLATE = {generic(p): v for p, v in flatten(complete_config(load_config(BASE_CASE)))}
 
 
 def cell_value(text, path):
@@ -131,10 +138,17 @@ def read_table(path):
     table["parameter"] = table["parameter"].str.strip()
     if not case_names(table):
         raise ValueError("The CSV needs at least one case column after 'description'.")
+    if is_legacy(table):
+        return table                           # old format: converted by read_case_csv
     unknown = [p for p in table["parameter"] if generic(p) not in TEMPLATE]
     if unknown:
         raise ValueError("Unknown parameters:\n  " + "\n  ".join(unknown))
     return table
+
+
+def is_legacy(table):
+    """True for a CSV of the old format (Cv choke, one-state model)."""
+    return bool(LEGACY_MARKERS & set(table["parameter"]))
 
 
 def case_names(table):
@@ -152,8 +166,10 @@ def read_case_csv(path):
         values = table[name].where(table[name].notna() & (table[name].str.strip() != ""), first)
         rows = [(p, cell_value(v, p)) for p, v in zip(table["parameter"], values) if pd.notna(v)]
         cfg = unflatten(rows)
+        if is_legacy(table):
+            cfg = migrate_config(cfg)[0]
         check_complete(cfg, name)
-        cfg.setdefault("name", name)
+        cfg["name"] = name                     # the column title names the case
         cfg["mud"]["name"] = name
         cases[name] = cfg
     return cases
@@ -190,9 +206,10 @@ def text_of(value):
     return value
 
 
-UNIT_SUFFIXES = [("_m_s", "m/s"), ("_per_s", "1/s"), ("_lbf100ft2", "lbf/100ft2"), ("_32nd", "1/32 in"),
+UNIT_SUFFIXES = [("_per_bar_s", "1/(bar s)"), ("_s_per_bar", "s/bar"), ("_per_bar", "1/bar"),
+                 ("_per_s", "1/s"), ("_lbf100ft2", "lbf/100ft2"), ("_32nd", "1/32 in"), ("_in2", "in2"),
                  ("_ppg", "ppg"), ("_cp", "cP"), ("_gpm", "gpm"), ("_psi", "psi"), ("_pa", "Pa"),
-                 ("_deg", "deg"), ("_in", "in"), ("_m", "m"), ("_s", "s")]
+                 ("_percent", "%"), ("_deg", "deg"), ("_in", "in"), ("_m", "m"), ("_s", "s")]
 
 
 def unit_of(path):
